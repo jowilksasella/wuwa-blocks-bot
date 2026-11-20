@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+*.key
+*.pem
+venv/
+.venv/
+captures/
+preview.png
+probe_*.png
+*.mp4

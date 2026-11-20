@@ -1,0 +1,18 @@
+{
+  "_note": "input_mode: 'foreground'(預設，僅鳴潮在前景才動、切走絕不搶滑鼠) 或 'post_message'(背景模式，配合 idle_wait_s 偵測滑鼠停手後才操作)。rotate_method: 'rmb'(滑鼠右鍵) 或 'r'。",
+  "input_mode": "foreground",
+  "idle_wait_s": 2.0,
+  "allow_rotate": true,
+  "rotate_method": "rmb",
+  "drag_offset_x": 0.0,
+  "drag_offset_y": 0.0,
+  "drag_steps": 12,
+  "step_ms": 14,
+  "hold_ms": 130,
+  "rotate_wait_ms": 150,
+  "post_up_ms": 110,
+  "post_drop_wait_s": 0.50,
+  "batch_refill_wait_s": 0.85,
+  "beam_width": 20,
+  "overlay_interval_ms": 250
+}
