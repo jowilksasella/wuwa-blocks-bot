@@ -240,18 +240,23 @@ def tile_features(tile_bgr):
       ring_std : std of whiteness in the outer ring -> crystal facets (>=32.1) vs flat skins (<=23.4)
       icon     : share of the centre that is much whiter than the ring -> bomb body (0.43-0.50),
                  medal icon (0.06-0.13), plain logo (0.0)
-      top_grad : mean gradient in the two top corners -> horned bomb spikes (~43) vs round (~10)
+      disc     : fill of a central disc (bomb body is solid) -> bombs 0.89-0.92, line-art medals <= 0.56
+      top_grad : whiteness gradient in the two top corners -> horned bomb spikes vs round body
+    Every feature uses only min(B, G, R) = V * (1 - S), which a hue change leaves untouched, so
+    tiles of any element colour (fire / ice / electro / light / dark / unseen wind ...) read the same.
     Calibrated on 2026-11-24 screenshots (live_medal_bombs.png + tests/tile_*.png).
     """
     t = cv2.resize(tile_bgr, (64, 64), interpolation=cv2.INTER_AREA)
     mn = t.min(axis=2).astype(np.float32)
-    gray = cv2.cvtColor(t, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    mag = np.hypot(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    mag = np.hypot(cv2.Sobel(mn, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(mn, cv2.CV_32F, 0, 1, ksize=3))
     ring = np.zeros((64, 64), dtype=bool)
     ring[3:61, 3:61] = True
     ring[10:54, 10:54] = False
     bg = float(np.median(mn[ring]))
+    yy, xx = np.mgrid[:64, :64]
+    disc = (xx - 32) ** 2 + (yy - 35) ** 2 <= 13 ** 2
     return {
+        "disc": float((mn[disc] > bg + 40).mean()),
         "ring_std": float(mn[ring].std()),
         "icon": float((mn[14:54, 14:50] > bg + 70).mean()),
         "top_grad": 0.5 * float(mag[5:20, 5:20].mean() + mag[5:20, 44:59].mean()),
@@ -267,7 +272,9 @@ def classify_tile(tile_bgr):
         # Crystal coat (故障方块). The icon underneath is hard to read through the facets; it is
         # re-read once the coat is stripped, so report no mark here.
         return True, MARK_NONE
-    if f["icon"] > 0.30:
+    # Bomb = big whitish icon AND a solid round body. The disc check keeps a large line-art medal
+    # icon (e.g. an element not captured yet, such as wind) from being mistaken for a bomb.
+    if f["icon"] > 0.30 and f["disc"] > 0.80:
         return False, (MARK_BOMB_BIG if f["top_grad"] > 25.0 else MARK_BOMB)
     if f["icon"] > 0.03:
         return False, MARK_MEDAL

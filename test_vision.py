@@ -90,6 +90,7 @@ def test_tile_crops_bomb_crystal_medal():
     expect = {
         "tile_bomb_big.png": (False, vision.MARK_BOMB_BIG),
         "tile_bomb.png": (False, vision.MARK_BOMB),
+        "tile_bomb_teal.png": (False, vision.MARK_BOMB),  # tutorial scale (~50px tile)
         "tile_crystal_snow.png": (True, vision.MARK_NONE),
         "tile_crystal_emblem.png": (True, vision.MARK_NONE),
         "tile_medal_snow.png": (False, vision.MARK_MEDAL),
@@ -101,7 +102,31 @@ def test_tile_crops_bomb_crystal_medal():
         if img is None:
             continue
         h, w = img.shape[:2]
-        assert vision.classify_tile(img[1 : h - 1, 1 : w - 1]) == want, name
+        if name != "tile_bomb_teal.png":
+            img = img[1 : h - 1, 1 : w - 1]
+        assert vision.classify_tile(img) == want, name
+        # Any element colour: bombs / crystals / medals can sit on tiles of every hue
+        # (incl. wind, not captured yet). Rotate hue in 15-degree steps; result must not change.
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        for d in range(15, 180, 15):
+            shifted = hsv.copy()
+            shifted[..., 0] = (shifted[..., 0].astype(np.int32) + d) % 180
+            got = vision.classify_tile(cv2.cvtColor(shifted, cv2.COLOR_HSV2BGR))
+            assert got == want, (name, d * 2, got)
+
+
+def test_large_line_icon_is_medal_not_bomb():
+    # Synthetic green tile with a thick hollow star/ring icon covering >30% of the centre,
+    # standing in for an unseen medal (e.g. wind). It has no solid round body -> medal.
+    tile = np.full((74, 74, 3), (90, 170, 40), dtype=np.uint8)
+    for ang in range(0, 360, 45):  # 8 thick petals around an open centre, inside the icon area
+        a = np.deg2rad(ang)
+        p0 = (int(37 + 8 * np.cos(a)), int(38 + 8 * np.sin(a)))
+        p1 = (int(37 + 19 * np.cos(a)), int(38 + 19 * np.sin(a)))
+        cv2.line(tile, p0, p1, (245, 250, 245), 6)
+    f = vision.tile_features(tile)
+    assert f["icon"] > 0.30, f
+    assert vision.classify_tile(tile) == (False, vision.MARK_MEDAL), f
 
 
 def test_saved_medal_mode_with_bombs_and_crystals():
