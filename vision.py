@@ -3,7 +3,7 @@
 All base coordinates are measured on a 1280x720 client area and scaled via
 layout(w, h) (following btw-helper's resolution-independent convention).
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import cv2
 import numpy as np
 
@@ -17,6 +17,12 @@ BX0, BY0, PITCH = 336.0, 56.0, 76.0
 # Right-hand tray dark box horizontal bounds on 1280x720: x=[1059, 1173] (width 115)
 TRAY_X0, TRAY_X1 = 1059.0, 1173.0
 TRAY_Y_MIN, TRAY_Y_MAX = 60.0, 660.0
+
+# Peek: a tray piece is dragged (not dropped) to the empty area left of the board, at the
+# vertical centre of the client area, so even a 5-tall bar is fully visible (holding it at the
+# slot's own y clips the bottom cells off-screen). The held piece is drawn at board tile scale.
+PEEK_X, PEEK_Y = 165.0, 360.0
+PEEK_AREA_X1 = 330.0  # held pieces are searched for in x = [0, 330] (board frame starts ~322)
 
 # Cell types on the 8x8 board
 EMPTY = 0
@@ -46,7 +52,8 @@ class TrayPiece:
     rows: int
     cols: int
     has_special: bool = False  # bomb / medal icon inside piece
-    specials: tuple = ()  # sorted (r, c) cells (same frame as `cells`) carrying an icon; treated as medals
+    specials: tuple = ()  # sorted (r, c) cells (same frame as `cells`) carrying an icon
+    special_marks: tuple = ()  # MARK_* aligned with `specials` (from a peek); empty -> assume medals
 
     @property
     def size(self):
@@ -463,6 +470,61 @@ def read_tray(frame):
     return pieces
 
 
+def peek_rotation(piece, allow_rotate=True):
+    """Clockwise turns to apply while peeking: a 5-wide piece does not fit left of the board,
+    so it is turned upright (the game keeps the new orientation when it returns to the slot)."""
+    return 1 if allow_rotate and piece.cols >= 5 and piece.rows < 5 else 0
+
+
+def locate_held_piece(before, during, rows, cols):
+    """Find the held piece's bounding box (x0, y0) in `during` by differencing against `before`.
+
+    Colour-independent: only what changed in the left peek area counts. A sliding box of the
+    piece's exact size (tile scale) picks the densest change, which ignores the small
+    "旋转" hint text drawn next to the cursor. Returns None if nothing piece-sized moved in.
+    """
+    h, w = during.shape[:2]
+    s, ox, oy = layout(w, h)
+    x_end = min(w, int(round(ox + PEEK_AREA_X1 * s)))
+    d = cv2.absdiff(before[:, :x_end], during[:, :x_end]).max(axis=2) > 40
+    d = cv2.morphologyEx(d.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    bw = int(round((cols * PITCH - 2.0) * s))
+    bh = int(round((rows * PITCH - 2.0) * s))
+    if bw > x_end or bh > h:
+        return None
+    ii = cv2.integral(d)
+    sums = ii[bh:, bw:] - ii[:-bh, bw:] - ii[bh:, :-bw] + ii[:-bh, :-bw]
+    y0, x0 = np.unravel_index(int(np.argmax(sums)), sums.shape)
+    # A single tile is ~74x74 at scale 1; require at least ~half a tile of change
+    if sums[y0, x0] < 0.5 * (PITCH * s) ** 2:
+        return None
+    return int(x0), int(y0)
+
+
+def read_held_marks(during, loc, cells):
+    """Classify every cell of a held piece at full tile scale. Returns {(r, c): MARK_*} (icons only)."""
+    h, w = during.shape[:2]
+    s = layout(w, h)[0]
+    x0, y0 = loc
+    size = (PITCH - 2.0) * s
+    out = {}
+    for r, c in cells:
+        tx, ty = x0 + c * PITCH * s, y0 + r * PITCH * s
+        tile = during[int(round(ty)) : int(round(ty + size)), int(round(tx)) : int(round(tx + size))]
+        if tile.size == 0:
+            continue
+        _, mark = classify_tile(tile)
+        if mark != MARK_NONE:
+            out[(r, c)] = mark
+    return out
+
+
+def with_marks(piece, mark_map):
+    """Return the TrayPiece with specials / special_marks taken from a peek result."""
+    spec = tuple(sorted(mark_map))
+    return replace(piece, specials=spec, special_marks=tuple(mark_map[rc] for rc in spec), has_special=bool(spec))
+
+
 def read_state(frame):
     """Return (board_8x8, pieces_list) or None if not currently inside a playable level."""
     if not in_level(frame):
@@ -497,7 +559,11 @@ def format_piece(piece):
         return "(empty)"
     grid = [["." for _ in range(piece.cols)] for _ in range(piece.rows)]
     for r, c in piece.cells:
-        grid[r][c] = "m" if (r, c) in piece.specials else "#"
+        if (r, c) in piece.specials:
+            i = piece.specials.index((r, c))
+            grid[r][c] = MARK_NAMES[piece.special_marks[i]] if piece.special_marks else "m"
+        else:
+            grid[r][c] = "#"
     tag = " [SPECIAL]" if piece.has_special else ""
     return f"Slot {piece.slot_idx} ({piece.rows}x{piece.cols}, {piece.size} cells){tag}:\n" + "\n".join(
         "  " + "".join(row) for row in grid

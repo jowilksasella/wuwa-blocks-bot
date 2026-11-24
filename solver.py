@@ -71,12 +71,12 @@ def rotate_cw(cells, k=1):
     return cur, rows, cols
 
 
-def rotate_tagged_cw(cells, specials=(), k=1):
-    """Rotate cells clockwise k*90 deg, carrying the subset `specials` along.
+def rotate_marked_cw(cells, mark_map=None, k=1):
+    """Rotate cells clockwise k*90 deg, carrying per-cell marks {(r, c): MARK_*} along.
 
-    Returns (norm_cells, rows, cols, norm_specials)."""
-    spec = set(specials)
-    cur = [(r, c, (r, c) in spec) for r, c in cells]
+    Returns (norm_cells, rows, cols, rotated_mark_map)."""
+    mark_map = mark_map or {}
+    cur = [(r, c, mark_map.get((r, c), MARK_NONE)) for r, c in cells]
     for _ in range(k % 4):
         rows = max(r for r, _, _ in cur) + 1
         cur = [(c, rows - 1 - r, t) for r, c, t in cur]
@@ -84,22 +84,39 @@ def rotate_tagged_cw(cells, specials=(), k=1):
     min_c = min(c for _, c, _ in cur)
     cur = [(r - min_r, c - min_c, t) for r, c, t in cur]
     norm = tuple(sorted((r, c) for r, c, _ in cur))
-    norm_spec = tuple(sorted((r, c) for r, c, t in cur if t))
     rows = max(r for r, _ in norm) + 1
     cols = max(c for _, c in norm) + 1
-    return norm, rows, cols, norm_spec
+    return norm, rows, cols, {(r, c): t for r, c, t in cur if t != MARK_NONE}
 
 
-def unique_rotations(cells, allow_rotate=True, specials=()):
-    """Return list of (rot_count, norm_cells, rows, cols, norm_specials) deduplicated by shape+icons."""
+def rotate_tagged_cw(cells, specials=(), k=1):
+    """Rotate cells clockwise k*90 deg, carrying the subset `specials` along.
+
+    Returns (norm_cells, rows, cols, norm_specials)."""
+    norm, rows, cols, mm = rotate_marked_cw(cells, {rc: MARK_MEDAL for rc in specials}, k)
+    return norm, rows, cols, tuple(sorted(mm))
+
+
+def piece_mark_map(piece):
+    """{(r, c): MARK_*} of a TrayPiece. Icons not identified by a peek are assumed to be medals."""
+    specials = getattr(piece, "specials", ())
+    kinds = getattr(piece, "special_marks", ()) or (MARK_MEDAL,) * len(specials)
+    return dict(zip(specials, kinds))
+
+
+def unique_rotations(cells, allow_rotate=True, specials=(), mark_map=None):
+    """Return list of (rot_count, norm_cells, rows, cols, rotated_mark_map) deduplicated by shape+icons."""
+    if mark_map is None:
+        mark_map = {rc: MARK_MEDAL for rc in specials}
     seen = set()
     out = []
     limit = 4 if allow_rotate else 1
     for rot in range(limit):
-        norm, rows, cols, nspec = rotate_tagged_cw(cells, specials, rot)
-        if (norm, nspec) not in seen:
-            seen.add((norm, nspec))
-            out.append((rot, norm, rows, cols, nspec))
+        norm, rows, cols, mm = rotate_marked_cw(cells, mark_map, rot)
+        key = (norm, tuple(sorted(mm.items())))
+        if key not in seen:
+            seen.add(key)
+            out.append((rot, norm, rows, cols, mm))
     return out
 
 
@@ -266,9 +283,8 @@ def legal_placements(grid, piece, allow_rotate=True):
     """Generate all legal (rot, top_r, top_c, board_cells, center_rc, cell_marks) for a TrayPiece."""
     occ = grid != EMPTY
     out = []
-    specials = getattr(piece, "specials", ())
-    for rot, norm, rows, cols, nspec in unique_rotations(piece.cells, allow_rotate=allow_rotate, specials=specials):
-        cell_marks = tuple(MARK_MEDAL if rc in nspec else MARK_NONE for rc in norm)
+    for rot, norm, rows, cols, mm in unique_rotations(piece.cells, allow_rotate=allow_rotate, mark_map=piece_mark_map(piece)):
+        cell_marks = tuple(mm.get(rc, MARK_NONE) for rc in norm)
         for tr in range(N - rows + 1):
             for tc in range(N - cols + 1):
                 ok = True
@@ -302,7 +318,7 @@ def solve_batch(grid, pieces, allow_rotate=True, beam_width=20, marks=None):
     # Deduplicate identical piece shapes across permutations (only if same cells & special)
     seen_orders = set()
     for order in permutations(active):
-        sig = tuple((p.cells, p.has_special, getattr(p, "specials", ())) for p in order)
+        sig = tuple((p.cells, tuple(sorted(piece_mark_map(p).items()))) for p in order)
         if sig in seen_orders:
             continue
         seen_orders.add(sig)

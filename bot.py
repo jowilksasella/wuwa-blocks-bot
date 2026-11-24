@@ -48,6 +48,10 @@ DEFAULT_CFG = {
     "post_drop_wait_s": 0.50,
     "batch_refill_wait_s": 0.85,
     "beam_width": 20,
+    # 托盤方塊預覽：把方塊拖到棋盤左側、畫面垂直中間（不放下）看清每格是炸彈還是獎章，再拖回原槽。
+    # "icons" = 只預覽托盤小圖上看到圖示的方塊；"all" = 每塊都預覽；"off" = 不預覽（圖示一律當獎章）
+    "peek_tray": "icons",
+    "peek_hold_s": 0.25,
 }
 
 
@@ -213,6 +217,72 @@ def wait_mouse_idle(idle_s, poll=0.10):
     return False
 
 
+def peek_tray(hwnd, frame, todo, cfg, cache):
+    """Drag each piece in `todo` out to the peek spot, screenshot it at tile scale, drag it back.
+
+    Fills cache[(slot_idx, cells)] = {(r, c): MARK_*} for all 4 orientations (the game keeps a
+    rotation made while dragging). Returns True if F8 was pressed."""
+    allow_rotate = bool(cfg["allow_rotate"])
+    input_mode = cfg.get("input_mode", "foreground")
+    h, w = frame.shape[:2]
+    hx, hy = vision.to_frame(vision.PEEK_X, vision.PEEK_Y, w, h)
+    os.makedirs(os.path.join(HERE, "captures"), exist_ok=True)
+    for p in todo:
+        if f8_pressed():
+            return True
+        if ready(hwnd, input_mode=input_mode):
+            return False
+        k = vision.peek_rotation(p, allow_rotate)
+        held_cells, rows, cols, _ = solver.rotate_marked_cw(p.cells, None, k)
+        shot = {}
+
+        def on_hold():
+            time.sleep(float(cfg.get("peek_hold_s", 0.25)))
+            shot["f"] = grab(hwnd)
+
+        sx, sy = p.center
+        inputs.drag_and_place(
+            hwnd, sx, sy, hx, hy,
+            rot=k,
+            rotate_method=cfg["rotate_method"],
+            input_mode=input_mode,
+            steps=int(cfg["drag_steps"]),
+            step_ms=int(cfg["step_ms"]),
+            hold_ms=int(cfg["hold_ms"]),
+            rotate_wait_ms=int(cfg["rotate_wait_ms"]),
+            post_up_ms=int(cfg.get("post_up_ms", 110)),
+            on_hold=on_hold,
+            return_xy=(sx, sy),
+        )
+        key = (p.slot_idx, p.cells)
+        loc = vision.locate_held_piece(frame, shot["f"], rows, cols) if "f" in shot else None
+        if "f" in shot:
+            cv2.imwrite(os.path.join(HERE, "captures", f"peek_slot{p.slot_idx + 1}.png"), shot["f"])
+        if loc is None:
+            print(f"  預覽槽位 {p.slot_idx + 1}：找不到被拖出的方塊，圖示暫當獎章", flush=True)
+            cache[key] = None
+            continue
+        held = vision.read_held_marks(shot["f"], loc, held_cells)
+        for j in (1, 2, 3, 0):  # held orientation (j=0) last so it wins for symmetric shapes
+            cj, _, _, mj = solver.rotate_marked_cw(held_cells, held, j)
+            cache[(p.slot_idx, cj)] = mj
+        names = {vision.MARK_MEDAL: "獎章", vision.MARK_BOMB: "炸彈3x3", vision.MARK_BOMB_BIG: "炸彈5x5"}
+        found = "、".join(f"{names[m]}@{rc}" for rc, m in sorted(held.items())) or "無圖示"
+        print(f"  預覽槽位 {p.slot_idx + 1}（{rows}x{cols}{'，已順轉90°' if k else ''}）：{found}", flush=True)
+    return False
+
+
+def apply_peek(pieces, cache):
+    out = []
+    for p in pieces:
+        if p is not None:
+            mm = cache.get((p.slot_idx, p.cells))
+            if mm is not None:
+                p = vision.with_marks(p, mm)
+        out.append(p)
+    return out
+
+
 def play_loop(hwnd, cfg, max_moves=0, trace=False):
     played = 0
     consecutive_misses = 0
@@ -221,6 +291,9 @@ def play_loop(hwnd, cfg, max_moves=0, trace=False):
     input_mode = cfg.get("input_mode", "foreground")
     idle_wait_s = float(cfg.get("idle_wait_s", 2.0))
     beam_width = int(cfg["beam_width"])
+    peek_mode = str(cfg.get("peek_tray", "icons")).lower()
+    peek_cache = {}
+    prev_count = 0
 
     while not max_moves or played < max_moves:
         if f8_pressed():
@@ -253,6 +326,25 @@ def play_loop(hwnd, cfg, max_moves=0, trace=False):
             if wait(float(cfg["batch_refill_wait_s"])):
                 return played
             continue
+
+        # Tray refilled -> new pieces may reuse a slot + shape with different icons
+        if len(active) > prev_count:
+            peek_cache.clear()
+        prev_count = len(active)
+        if peek_mode != "off":
+            todo = [
+                p for p in active
+                if (p.slot_idx, p.cells) not in peek_cache and (p.specials or peek_mode == "all")
+            ]
+            if todo:
+                status("預覽托盤方塊圖示中...")
+                if peek_tray(hwnd, frame, todo, cfg, peek_cache):
+                    return played
+                if wait(0.15):
+                    return played
+                continue  # re-read: a peeked 5-wide piece now sits upright in its slot
+            pieces = apply_peek(pieces, peek_cache)
+            active = [p for p in pieces if p is not None]
 
         t0 = time.perf_counter()
         plan = solver.solve_batch(grid, pieces, allow_rotate=allow_rotate, beam_width=beam_width, marks=marks)

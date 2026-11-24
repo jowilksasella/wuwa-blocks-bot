@@ -152,6 +152,63 @@ def test_saved_medal_mode_with_bombs_and_crystals():
     assert plan is not None and plan.complete_batch
 
 
+def test_four_slot_tray():
+    frame = _load("live_peek_2.png")
+    if frame is None:
+        return
+    slots = vision.detect_tray_slots(frame)
+    assert len(slots) == 4
+    pieces = vision.read_tray(frame)
+    assert pieces[0].cells == ((0, 1), (1, 0), (1, 1), (2, 1)) and pieces[0].specials == ((1, 0),)
+    assert pieces[1].cells == ((0, 0), (1, 0), (1, 1), (2, 1)) and pieces[1].specials == ((2, 1),)
+    assert pieces[2].cells == ((0, 0), (0, 1), (1, 0), (2, 0)) and pieces[2].specials == ((1, 0),)
+    assert pieces[3] is None  # slot 4's piece is being held at the left
+
+
+def test_locate_held_piece_real_capture():
+    # live_peek_1: the 5x1 bar is held over the tray; live_peek_2: same bar held left of the board
+    before, during = _load("live_peek_1.png"), _load("live_peek_2.png")
+    if before is None or during is None:
+        return
+    loc = vision.locate_held_piece(before, during, 5, 1)
+    assert loc is not None and abs(loc[0] - 133) <= 2 and abs(loc[1] - 305) <= 2, loc
+    assert vision.read_held_marks(during, loc, [(r, 0) for r in range(5)]) == {}
+    # Nothing moved -> no piece
+    assert vision.locate_held_piece(before, before, 2, 2) is None
+
+
+def test_held_piece_bomb_and_medal_types():
+    before, src = _load("live_peek_1.png"), _load("live_medal_bombs.png")
+    big, med = _load("tile_bomb_big.png"), _load("tile_medal_emblem.png")
+    if before is None or src is None or big is None or med is None:
+        return
+    syn = before.copy()
+    x0, y0 = 40, 250
+
+    def put(r, c, tile):
+        syn[y0 + r * 76 : y0 + r * 76 + 74, x0 + c * 76 : x0 + c * 76 + 74] = cv2.resize(tile, (74, 74))
+
+    def board_tile(r, c):
+        bx, by = [int(round(t)) for t in vision.cell_rect(r, c)[:2]]
+        return src[by : by + 74, bx : bx + 74]
+
+    put(0, 0, board_tile(2, 3))   # pink round bomb
+    put(0, 1, board_tile(3, 3))   # plain
+    put(0, 2, board_tile(4, 5))   # orange round bomb
+    put(1, 0, board_tile(4, 4))   # plain
+    put(1, 1, big[1:-1, 1:-1])
+    put(1, 2, med[1:-1, 1:-1])
+    loc = vision.locate_held_piece(before, syn, 2, 3)
+    assert loc == (x0, y0), loc
+    got = vision.read_held_marks(syn, loc, [(r, c) for r in range(2) for c in range(3)])
+    assert got == {
+        (0, 0): vision.MARK_BOMB,
+        (0, 2): vision.MARK_BOMB,
+        (1, 1): vision.MARK_BOMB_BIG,
+        (1, 2): vision.MARK_MEDAL,
+    }, got
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -175,6 +175,24 @@ def test_solver_prefers_collecting_medals():
     assert plan.total_medals == 1
 
 
+def test_peeked_tray_bomb_rotates_and_detonates():
+    from vision import with_marks
+    # 1x2 piece: bomb on the left cell. Turned 90 CW it is vertical with the bomb on top.
+    p = with_marks(_piece([(0, 0), (0, 1)]), {(0, 0): MARK_BOMB})
+    rots = {rot: mm for rot, _, _, _, mm in solver.unique_rotations(p.cells, mark_map=solver.piece_mark_map(p))}
+    assert rots[1] == {(0, 0): MARK_BOMB}
+    assert rots[2] == {(0, 1): MARK_BOMB}
+    # Row 0 open at cols 6-7 only; the placed bomb clears with the row and blasts row 1 below it
+    g = np.zeros((N, N), dtype=np.int32)
+    m = np.zeros((N, N), dtype=np.int32)
+    g[0, :6] = NORMAL
+    g[1, 5:8] = NORMAL
+    plan = solver.solve_batch(g, [p], allow_rotate=True, marks=m)
+    mv = plan.moves[0]
+    assert mv.board_cells == ((0, 6), (0, 7)) and mv.bombs == 1
+    assert not plan.final_grid[1, 5:8].any()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

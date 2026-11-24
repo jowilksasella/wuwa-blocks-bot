@@ -178,6 +178,8 @@ def drag_and_place_post_message(
     hold_ms=130,
     rotate_wait_ms=150,
     post_up_ms=110,
+    on_hold=None,
+    return_xy=None,
 ):
     """Background-capable drag + rotate via PostMessage + SetCursorPos (ok-ww style).
 
@@ -230,6 +232,18 @@ def drag_and_place_post_message(
             move_client(x1, y1, win32con.MK_LBUTTON)
             time.sleep(hold_s)
 
+        if on_hold is not None:
+            on_hold()
+        if return_xy is not None:
+            rx, ry = return_xy
+            for i in range(1, steps + 1):
+                t = i / steps
+                move_client(x1 + (rx - x1) * t, y1 + (ry - y1) * t, win32con.MK_LBUTTON)
+                time.sleep(step_ms / 1000.0)
+            move_client(rx, ry, win32con.MK_LBUTTON)
+            time.sleep(hold_s)
+            x1, y1 = rx, ry
+
         # Release and wait >=2 background frames before restoring cursor
         _post(hwnd, win32con.WM_LBUTTONUP, 0, _lp(x1, y1))
         time.sleep(post_up_s)
@@ -252,8 +266,14 @@ def drag_and_place_foreground(
     step_ms=12,
     hold_ms=70,
     rotate_wait_ms=140,
+    on_hold=None,
+    return_xy=None,
 ):
-    """Foreground drag + rotate via SetCursorPos + SendInput (match3-bot style)."""
+    """Foreground drag + rotate via SetCursorPos + SendInput (match3-bot style).
+
+    on_hold: called while the piece is still held at (x1, y1) (used to screenshot a peek).
+    return_xy: if given, drag back there before releasing (peek: drop back on the tray slot).
+    """
     sx, sy = to_screen(hwnd, x0, y0)
     ex, ey = to_screen(hwnd, x1, y1)
     hold_s = hold_ms / 1000.0
@@ -280,6 +300,16 @@ def drag_and_place_foreground(
         move_screen(ex, ey)
         time.sleep(hold_s)
 
+    if on_hold is not None:
+        on_hold()
+    if return_xy is not None:
+        rx, ry = to_screen(hwnd, *return_xy)
+        for i in range(1, steps + 1):
+            t = i / steps
+            move_screen(ex + (rx - ex) * t, ey + (ry - ey) * t)
+            time.sleep(step_ms / 1000.0)
+        time.sleep(hold_s)
+
     _send_mouse(MOUSEEVENTF_LEFTUP)
     time.sleep(0.04)
 
@@ -298,14 +328,17 @@ def drag_and_place(
     hold_ms=130,
     rotate_wait_ms=150,
     post_up_ms=110,
+    on_hold=None,
+    return_xy=None,
 ):
     if (input_mode or "post_message").lower() == "foreground":
         return drag_and_place_foreground(
             hwnd, x0, y0, x1, y1, rot=rot, rotate_method=rotate_method,
             steps=steps, step_ms=step_ms, hold_ms=hold_ms, rotate_wait_ms=rotate_wait_ms,
+            on_hold=on_hold, return_xy=return_xy,
         )
     return drag_and_place_post_message(
         hwnd, x0, y0, x1, y1, rot=rot, rotate_method=rotate_method,
         steps=steps, step_ms=step_ms, hold_ms=hold_ms, rotate_wait_ms=rotate_wait_ms,
-        post_up_ms=post_up_ms,
+        post_up_ms=post_up_ms, on_hold=on_hold, return_xy=return_xy,
     )
