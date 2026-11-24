@@ -106,16 +106,16 @@ class Overlay:
             self.root.geometry(geo)
 
         frame = grab(self.hwnd)
-        state = vision.read_state(frame)
+        state = vision.read_state_full(frame)
         if state is None:
             return self.clear()
-        grid, pieces = state
-        active_sig = tuple((p.slot_idx, p.cells, p.has_special) if p else None for p in pieces)
-        sig = (geo, grid.tobytes(), active_sig, self.allow_rotate)
+        grid, marks, pieces = state
+        active_sig = tuple((p.slot_idx, p.cells, p.specials) if p else None for p in pieces)
+        sig = (geo, grid.tobytes(), marks.tobytes(), active_sig, self.allow_rotate)
         if sig == self.last_sig:
             return
 
-        plan = solver.solve_batch(grid, pieces, allow_rotate=self.allow_rotate, beam_width=self.beam_width)
+        plan = solver.solve_batch(grid, pieces, allow_rotate=self.allow_rotate, beam_width=self.beam_width, marks=marks)
         self.canvas.delete("all")
         self.draw(w, h, grid, pieces, plan)
         self.last_sig = sig
@@ -205,20 +205,20 @@ def main():
         if not hwnd:
             sys.exit("找不到鳴潮視窗 (Client-Win64-Shipping.exe)")
         frame = grab(hwnd)
-        state = vision.read_state(frame)
+        state = vision.read_state_full(frame)
         if state is None:
             sys.exit("畫面上沒有識別到拉海洛方塊 8x8 棋盤")
-        grid, pieces = state
-        plan = solver.solve_batch(grid, pieces, allow_rotate=allow_rotate)
-        print(vision.format_board(grid))
+        grid, marks, pieces = state
+        plan = solver.solve_batch(grid, pieces, allow_rotate=allow_rotate, marks=marks)
+        print(vision.format_board(grid, marks))
         for p in pieces:
             print(vision.format_piece(p))
         if plan:
-            print(f"\n推薦方案 (總消 {plan.total_lines} 行/列, +{plan.total_points}分):")
+            print(f"\n推薦方案 (總消 {plan.total_lines} 行/列, +{plan.total_points}分, 獎章 {plan.total_medals}):")
             for i, mv in enumerate(plan.moves):
                 print(f"  #{i + 1}: 槽位{mv.slot_idx + 1} {ROT_LABELS[mv.rot]} -> 第{mv.top_r + 1}行第{mv.top_c + 1}列 (消{mv.lines_cleared})")
         out = os.path.join(HERE, "preview.png")
-        vision.render_preview(frame, grid, pieces, plan, out)
+        vision.render_preview(frame, grid, pieces, plan, out, marks=marks)
         print("已儲存預覽圖:", out)
         return
 

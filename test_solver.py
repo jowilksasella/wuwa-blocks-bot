@@ -2,7 +2,7 @@
 import numpy as np
 
 import solver
-from vision import N, EMPTY, NORMAL, CORRUPTED, FAULT, TrayPiece
+from vision import N, EMPTY, NORMAL, CORRUPTED, FAULT, TrayPiece, MARK_NONE, MARK_MEDAL, MARK_BOMB, MARK_BOMB_BIG
 
 
 def _piece(cells, slot_idx=0, has_special=False):
@@ -90,6 +90,89 @@ def test_batch_order_avoids_deadlock():
     assert plan.complete_batch
     assert plan.moves[0].slot_idx == 1  # MUST place 1x1 first to clear space for 1x4!
     assert plan.moves[1].slot_idx == 0
+
+
+def _row0_ready():
+    """Row 0 full except (0, 7); placing a 1x1 there clears row 0 only."""
+    g = np.zeros((N, N), dtype=np.int32)
+    g[0, :7] = NORMAL
+    return g, np.zeros((N, N), dtype=np.int32)
+
+
+def test_round_bomb_clears_3x3():
+    g, m = _row0_ready()
+    g[1, 2:5] = NORMAL
+    g[2, 3] = NORMAL  # outside 3x3 of a bomb at (0, 3): must survive
+    m[0, 3] = MARK_BOMB
+    ng, nm, lines, _, _, _, bombs, _ = solver.apply_move_ex(g, m, ((0, 7),))
+    assert lines == 1 and bombs == 1
+    assert not ng[1, 2:5].any()
+    assert ng[2, 3] == NORMAL
+
+
+def test_horned_bomb_clears_5x5_and_chains():
+    g, m = _row0_ready()
+    m[0, 1] = MARK_BOMB_BIG          # reaches rows 0..2, cols 0..3
+    g[2, 3] = NORMAL
+    m[2, 3] = MARK_BOMB              # chained: reaches rows 1..3, cols 2..4
+    g[3, 4] = NORMAL
+    g[4, 4] = NORMAL                 # out of every blast
+    ng, _, _, _, _, _, bombs, _ = solver.apply_move_ex(g, m, ((0, 7),))
+    assert bombs == 2
+    assert ng[2, 3] == EMPTY and ng[3, 4] == EMPTY
+    assert ng[4, 4] == NORMAL
+
+
+def test_bomb_on_crystal_does_not_detonate():
+    g, m = _row0_ready()
+    g[0, 3] = FAULT
+    m[0, 3] = MARK_BOMB
+    g[1, 3] = NORMAL
+    ng, nm, _, _, faults, _, bombs, _ = solver.apply_move_ex(g, m, ((0, 7),))
+    assert bombs == 0 and faults == 1
+    assert ng[0, 3] == NORMAL and nm[0, 3] == MARK_BOMB  # crystal gone, bomb armed for next clear
+    assert ng[1, 3] == NORMAL
+
+
+def test_blast_strips_crystal_and_spares_corrupted():
+    g, m = _row0_ready()
+    m[0, 3] = MARK_BOMB
+    g[1, 2] = FAULT
+    g[1, 4] = CORRUPTED
+    ng, _, _, _, faults, _, _, _ = solver.apply_move_ex(g, m, ((0, 7),))
+    assert ng[1, 2] == NORMAL and faults == 1
+    assert ng[1, 4] == CORRUPTED
+
+
+def test_medal_counted_only_when_tile_removed():
+    g, m = _row0_ready()
+    m[0, 2] = MARK_MEDAL
+    g[0, 5] = FAULT
+    m[0, 5] = MARK_MEDAL  # crystal medal: first clear only strips the crystal
+    _, nm, _, _, _, medals, _, _ = solver.apply_move_ex(g, m, ((0, 7),))
+    assert medals == 1
+    assert nm[0, 5] == MARK_MEDAL
+
+
+def test_tray_medal_rotates_with_piece():
+    # 1x3 bar with medal on the left end; rotated 90 CW the medal ends on top
+    norm, rows, cols, spec = solver.rotate_tagged_cw(((0, 0), (0, 1), (0, 2)), ((0, 0),), 1)
+    assert (rows, cols) == (3, 1)
+    assert spec == ((0, 0),)
+    norm, rows, cols, spec = solver.rotate_tagged_cw(((0, 0), (0, 1), (0, 2)), ((0, 0),), 2)
+    assert spec == ((0, 2),)
+
+
+def test_solver_prefers_collecting_medals():
+    # Two open lines: row 0 (has a medal) and row 7 (no medal). One 1x1 piece can close either.
+    g = np.zeros((N, N), dtype=np.int32)
+    m = np.zeros((N, N), dtype=np.int32)
+    g[0, :7] = NORMAL
+    g[7, 1:] = NORMAL
+    m[0, 3] = MARK_MEDAL
+    plan = solver.solve_batch(g, [_piece([(0, 0)])], allow_rotate=True, marks=m)
+    assert plan.moves[0].board_cells == ((0, 7),)
+    assert plan.total_medals == 1
 
 
 if __name__ == "__main__":

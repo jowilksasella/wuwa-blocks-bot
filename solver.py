@@ -2,18 +2,26 @@
 
 Faithfully models:
   - 90-degree clockwise piece rotation (0/90/180/270, deduplicated per shape)
-  - Multi-line clear scoring: 100 * lines^2 + 100 (1->200, 2->500, 3->1000, 4->1700, 5->2600)
+  - Multi-line clear scoring: 1->200, 2->500, 3->1000, 4->1500, 5->2500 (LINE_SCORES)
   - Consecutive clear combo bonus
   - CORRUPTED (grey 数据损坏方块): indestructible, stays occupied when row/col clears
   - FAULT (1级/2级故障方块): stays occupied after 1st clear (fault layer stripped), prioritized
   - SPECIAL pieces (bomb/medal): bonus when cleared in a completed line
+  - Bombs (marks): a cleared bomb tile also clears its 3x3 (无角) / 5x5 (有角) area; chains into
+    other bombs. A bomb on a FAULT (crystal) tile only loses the crystal and does not detonate.
+  - Medals (收集奖章模式): counted when a medal tile is actually removed (crystal medals first
+    turn NORMAL). The level is won by medal count, so medals dominate the ranking score.
   - Full-batch deadlock avoidance: always prefers plans that place every piece in the current batch
 """
 from dataclasses import dataclass
 from itertools import permutations
 import numpy as np
 
-from vision import N, EMPTY, NORMAL, CORRUPTED, FAULT
+from vision import N, EMPTY, NORMAL, CORRUPTED, FAULT, MARK_NONE, MARK_MEDAL, BOMB_RADIUS
+
+# Ranking weight per collected medal. Larger than a fault hit (28) and a 2-line bonus, so the
+# search prefers collecting medals; board health still breaks ties and prevents deadlock.
+MEDAL_WEIGHT = 60.0
 
 
 @dataclass(frozen=True)
@@ -28,6 +36,8 @@ class Move:
     points: int
     faults_hit: int
     special_cleared: int
+    medals: int = 0      # medal tiles removed by this move (lines + blasts)
+    bombs: int = 0       # bombs detonated by this move (incl. chain)
 
 
 @dataclass(frozen=True)
@@ -39,6 +49,8 @@ class Plan:
     total_faults_hit: int
     complete_batch: bool
     final_grid: np.ndarray
+    total_medals: int = 0
+    final_marks: np.ndarray = None
 
 
 def normalize_cells(cells):
@@ -59,16 +71,35 @@ def rotate_cw(cells, k=1):
     return cur, rows, cols
 
 
-def unique_rotations(cells, allow_rotate=True):
-    """Return list of (rot_count, norm_cells, rows, cols) deduplicated by shape."""
+def rotate_tagged_cw(cells, specials=(), k=1):
+    """Rotate cells clockwise k*90 deg, carrying the subset `specials` along.
+
+    Returns (norm_cells, rows, cols, norm_specials)."""
+    spec = set(specials)
+    cur = [(r, c, (r, c) in spec) for r, c in cells]
+    for _ in range(k % 4):
+        rows = max(r for r, _, _ in cur) + 1
+        cur = [(c, rows - 1 - r, t) for r, c, t in cur]
+    min_r = min(r for r, _, _ in cur)
+    min_c = min(c for _, c, _ in cur)
+    cur = [(r - min_r, c - min_c, t) for r, c, t in cur]
+    norm = tuple(sorted((r, c) for r, c, _ in cur))
+    norm_spec = tuple(sorted((r, c) for r, c, t in cur if t))
+    rows = max(r for r, _ in norm) + 1
+    cols = max(c for _, c in norm) + 1
+    return norm, rows, cols, norm_spec
+
+
+def unique_rotations(cells, allow_rotate=True, specials=()):
+    """Return list of (rot_count, norm_cells, rows, cols, norm_specials) deduplicated by shape+icons."""
     seen = set()
     out = []
     limit = 4 if allow_rotate else 1
     for rot in range(limit):
-        norm, rows, cols = rotate_cw(cells, rot)
-        if norm not in seen:
-            seen.add(norm)
-            out.append((rot, norm, rows, cols))
+        norm, rows, cols, nspec = rotate_tagged_cw(cells, specials, rot)
+        if (norm, nspec) not in seen:
+            seen.add((norm, nspec))
+            out.append((rot, norm, rows, cols, nspec))
     return out
 
 
@@ -81,44 +112,69 @@ def line_points(lines):
     return LINE_SCORES.get(lines, 100 * lines * lines)
 
 
-def apply_move(grid, board_cells, has_special=False):
-    """Apply a legal placement onto a copy of grid.
+def _blast(clear_mask, ng, nm):
+    """Extend clear_mask with bomb blasts (chained). Only bombs on NORMAL tiles detonate.
 
-    Returns (next_grid, lines_cleared, points, faults_hit, special_cleared).
-    """
+    Returns number of bombs detonated."""
+    queue = [(r, c) for r, c in zip(*np.nonzero(clear_mask & (ng == NORMAL) & (nm >= 2)))]
+    done = set()
+    while queue:
+        r, c = queue.pop()
+        if (r, c) in done:
+            continue
+        done.add((r, c))
+        rad = BOMB_RADIUS.get(int(nm[r, c]), 0)
+        for rr in range(max(0, r - rad), min(N, r + rad + 1)):
+            for cc in range(max(0, c - rad), min(N, c + rad + 1)):
+                if not clear_mask[rr, cc]:
+                    clear_mask[rr, cc] = True
+                    if ng[rr, cc] == NORMAL and int(nm[rr, cc]) in BOMB_RADIUS:
+                        queue.append((rr, cc))
+    return len(done)
+
+
+def apply_move_ex(grid, marks, board_cells, cell_marks=None):
+    """Apply a placement with per-cell marks. Returns
+    (next_grid, next_marks, lines, points, faults_hit, medals, bombs, cleared_mask)."""
     ng = grid.copy()
-    for r, c in board_cells:
+    nm = marks.copy() if marks is not None else np.zeros((N, N), dtype=np.int32)
+    for i, (r, c) in enumerate(board_cells):
         ng[r, c] = NORMAL
+        nm[r, c] = cell_marks[i] if cell_marks else MARK_NONE
 
     full_rows = [r for r in range(N) if np.all(ng[r, :] != EMPTY)]
     full_cols = [c for c in range(N) if np.all(ng[:, c] != EMPTY)]
     lines = len(full_rows) + len(full_cols)
 
-    faults_hit = 0
-    special_cleared = 0
-    if lines > 0:
-        clear_mask = np.zeros((N, N), dtype=bool)
-        for r in full_rows:
-            clear_mask[r, :] = True
-        for c in full_cols:
-            clear_mask[:, c] = True
+    clear_mask = np.zeros((N, N), dtype=bool)
+    if lines == 0:
+        return ng, nm, 0, 0, 0, 0, 0, clear_mask
+    for r in full_rows:
+        clear_mask[r, :] = True
+    for c in full_cols:
+        clear_mask[:, c] = True
+    bombs = _blast(clear_mask, ng, nm)
 
-        # Only non-corrupted cells react to clearing:
-        # - NORMAL -> EMPTY
-        # - FAULT  -> NORMAL (fault stripped once; stays occupied for remainder of batch lookahead)
-        # - CORRUPTED -> stays CORRUPTED
-        fault_cleared = clear_mask & (ng == FAULT)
-        faults_hit = int(fault_cleared.sum())
-        normal_cleared = clear_mask & (ng == NORMAL)
+    # Each hit cell reacts once per move (assumption: a line + blast overlap is still one hit):
+    # NORMAL -> EMPTY (mark collected / consumed), FAULT -> NORMAL (crystal stripped, mark kept),
+    # CORRUPTED -> unchanged (assumed blast-proof as well).
+    fault_cleared = clear_mask & (ng == FAULT)
+    normal_cleared = clear_mask & (ng == NORMAL)
+    medals = int((normal_cleared & (nm == MARK_MEDAL)).sum())
+    ng[normal_cleared] = EMPTY
+    nm[normal_cleared] = MARK_NONE
+    ng[fault_cleared] = NORMAL
+    return ng, nm, lines, line_points(lines), int(fault_cleared.sum()), medals, bombs, normal_cleared
 
-        ng[normal_cleared] = EMPTY
-        ng[fault_cleared] = NORMAL
 
-        if has_special:
-            if any(clear_mask[r, c] for r, c in board_cells):
-                special_cleared = 1
+def apply_move(grid, board_cells, has_special=False):
+    """Apply a legal placement onto a copy of grid (no marks; legacy API).
 
-    return ng, lines, line_points(lines), faults_hit, special_cleared
+    Returns (next_grid, lines_cleared, points, faults_hit, special_cleared).
+    """
+    ng, _, lines, pts, faults_hit, _, _, cleared = apply_move_ex(grid, None, board_cells)
+    special_cleared = 1 if has_special and any(cleared[r, c] for r, c in board_cells) else 0
+    return ng, lines, pts, faults_hit, special_cleared
 
 
 def _hole_penalty(empty_mask):
@@ -207,10 +263,12 @@ def evaluate_board(grid):
 
 
 def legal_placements(grid, piece, allow_rotate=True):
-    """Generate all legal (rot, top_r, top_c, board_cells, center_rc) for a TrayPiece."""
+    """Generate all legal (rot, top_r, top_c, board_cells, center_rc, cell_marks) for a TrayPiece."""
     occ = grid != EMPTY
     out = []
-    for rot, norm, rows, cols in unique_rotations(piece.cells, allow_rotate=allow_rotate):
+    specials = getattr(piece, "specials", ())
+    for rot, norm, rows, cols, nspec in unique_rotations(piece.cells, allow_rotate=allow_rotate, specials=specials):
+        cell_marks = tuple(MARK_MEDAL if rc in nspec else MARK_NONE for rc in norm)
         for tr in range(N - rows + 1):
             for tc in range(N - cols + 1):
                 ok = True
@@ -221,16 +279,19 @@ def legal_placements(grid, piece, allow_rotate=True):
                 if ok:
                     bcells = tuple((tr + dr, tc + dc) for dr, dc in norm)
                     center_rc = (tr + (rows - 1) * 0.5, tc + (cols - 1) * 0.5)
-                    out.append((rot, tr, tc, bcells, center_rc))
+                    out.append((rot, tr, tc, bcells, center_rc, cell_marks))
     return out
 
 
-def solve_batch(grid, pieces, allow_rotate=True, beam_width=20):
+def solve_batch(grid, pieces, allow_rotate=True, beam_width=20, marks=None):
     """Find the optimal ordered sequence of rotated placements for the current tray batch.
 
     pieces: list of (TrayPiece or None)
+    marks: optional 8x8 MARK_* array (medals / bombs) from vision.read_board_marks
     Returns Plan or None if no legal placement exists for any piece.
     """
+    if marks is None:
+        marks = np.zeros((N, N), dtype=np.int32)
     active = [p for p in pieces if p is not None]
     if not active:
         return None
@@ -241,20 +302,21 @@ def solve_batch(grid, pieces, allow_rotate=True, beam_width=20):
     # Deduplicate identical piece shapes across permutations (only if same cells & special)
     seen_orders = set()
     for order in permutations(active):
-        sig = tuple((p.cells, p.has_special) for p in order)
+        sig = tuple((p.cells, p.has_special, getattr(p, "specials", ())) for p in order)
         if sig in seen_orders:
             continue
         seen_orders.add(sig)
 
-        # Beam entries: (rank_score, cur_grid, moves_tuple, cum_points, cum_lines, cum_faults, cum_spec, cum_bonus, streak)
-        beam = [(0.0, grid, (), 0, 0, 0, 0, 0.0, 0)]
+        # Beam entries: (rank_score, cur_grid, moves_tuple, cum_points, cum_lines, cum_faults, cum_spec, cum_bonus, streak, cur_marks, cum_medals)
+        beam = [(0.0, grid, (), 0, 0, 0, 0, 0.0, 0, marks, 0)]
 
         for depth, piece in enumerate(order):
             next_beam = []
-            for _, cur_g, mvs, pts, lines_tot, faults_tot, spec_tot, bonus_tot, streak in beam:
+            for _, cur_g, mvs, pts, lines_tot, faults_tot, spec_tot, bonus_tot, streak, cur_m, med_tot in beam:
                 placements = legal_placements(cur_g, piece, allow_rotate=allow_rotate)
-                for rot, tr, tc, bcells, center_rc in placements:
-                    ng, ln, gain, fh, sp = apply_move(cur_g, bcells, has_special=piece.has_special)
+                for rot, tr, tc, bcells, center_rc, cmarks in placements:
+                    ng, nm, ln, gain, fh, med, nb, cleared = apply_move_ex(cur_g, cur_m, bcells, cmarks)
+                    sp = 1 if piece.has_special and any(cleared[r, c] for r, c in bcells) else 0
                     new_streak = streak + 1 if ln > 0 else 0
                     combo_bonus = 18.0 * (new_streak - 1) if new_streak >= 2 else 0.0
                     multi_bonus = 22.0 * max(0, ln - 1) ** 2
@@ -275,28 +337,32 @@ def solve_batch(grid, pieces, allow_rotate=True, beam_width=20):
                         points=gain,
                         faults_hit=fh,
                         special_cleared=sp,
+                        medals=med,
+                        bombs=nb,
                     )
                     new_pts = pts + gain
                     new_lines = lines_tot + ln
                     new_faults = faults_tot + fh
                     new_spec = spec_tot + sp
+                    new_med = med_tot + med
 
                     total_score = (
                         new_pts * 0.14
                         + new_faults * 28.0
                         + new_spec * 32.0
+                        + new_med * MEDAL_WEIGHT
                         + new_bonus
                         + h_val
                     )
                     next_beam.append(
-                        (total_score, ng, mvs + (mv,), new_pts, new_lines, new_faults, new_spec, new_bonus, new_streak)
+                        (total_score, ng, mvs + (mv,), new_pts, new_lines, new_faults, new_spec, new_bonus, new_streak, nm, new_med)
                     )
 
             if not next_beam:
                 # Record longest partial plan in case all full orders deadlock
-                for sc, cur_g, mvs, pts, lines_tot, faults_tot, spec_tot, _, _ in beam:
+                for sc, cur_g, mvs, pts, lines_tot, faults_tot, spec_tot, _, _, cur_m, med_tot in beam:
                     if mvs:
-                        cand = Plan(mvs, sc, pts, lines_tot, faults_tot, False, cur_g)
+                        cand = Plan(mvs, sc, pts, lines_tot, faults_tot, False, cur_g, med_tot, cur_m)
                         if best_partial is None or (len(cand.moves), cand.score) > (
                             len(best_partial.moves),
                             best_partial.score,
@@ -311,8 +377,8 @@ def solve_batch(grid, pieces, allow_rotate=True, beam_width=20):
             beam = next_beam[:width]
 
         if beam:
-            sc, cur_g, mvs, pts, lines_tot, faults_tot, _, _, _ = beam[0]
-            cand = Plan(mvs, sc, pts, lines_tot, faults_tot, True, cur_g)
+            sc, cur_g, mvs, pts, lines_tot, faults_tot, _, _, _, cur_m, med_tot = beam[0]
+            cand = Plan(mvs, sc, pts, lines_tot, faults_tot, True, cur_g, med_tot, cur_m)
             if best_complete is None or cand.score > best_complete.score:
                 best_complete = cand
 

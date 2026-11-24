@@ -79,6 +79,54 @@ def test_saved_lvl2_3slot_with_corrupted_and_5x1():
     assert pieces[2].cells == ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4))
 
 
+def _load(name):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", name)
+    if not os.path.exists(path):
+        return None
+    return cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_COLOR)
+
+
+def test_tile_crops_bomb_crystal_medal():
+    expect = {
+        "tile_bomb_big.png": (False, vision.MARK_BOMB_BIG),
+        "tile_bomb.png": (False, vision.MARK_BOMB),
+        "tile_crystal_snow.png": (True, vision.MARK_NONE),
+        "tile_crystal_emblem.png": (True, vision.MARK_NONE),
+        "tile_medal_snow.png": (False, vision.MARK_MEDAL),
+        "tile_medal_emblem.png": (False, vision.MARK_MEDAL),
+        "tile_plain.png": (False, vision.MARK_NONE),
+    }
+    for name, want in expect.items():
+        img = _load(name)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        assert vision.classify_tile(img[1 : h - 1, 1 : w - 1]) == want, name
+
+
+def test_saved_medal_mode_with_bombs_and_crystals():
+    frame = _load("live_medal_bombs.png")
+    if frame is None:
+        return
+    grid, marks, pieces = vision.read_state_full(frame)
+    crystals = {(1, 3), (2, 2), (3, 1), (3, 4), (4, 3), (4, 6), (5, 5), (6, 4)}
+    bombs = {(2, 3), (3, 2), (4, 5), (5, 4)}
+    plain = {(3, 3), (4, 4)}
+    for r in range(vision.N):
+        for c in range(vision.N):
+            if (r, c) in crystals:
+                assert grid[r, c] == vision.FAULT, (r, c)
+            elif (r, c) in bombs:
+                assert grid[r, c] == vision.NORMAL and marks[r, c] == vision.MARK_BOMB, (r, c)
+            elif (r, c) in plain:
+                assert grid[r, c] == vision.NORMAL and marks[r, c] == vision.MARK_NONE, (r, c)
+            else:
+                assert grid[r, c] == vision.EMPTY, (r, c)
+    assert [p.specials for p in pieces] == [((1, 0),), ((2, 0),), ((1, 2),)]
+    plan = solver.solve_batch(grid, pieces, allow_rotate=True, marks=marks)
+    assert plan is not None and plan.complete_batch
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

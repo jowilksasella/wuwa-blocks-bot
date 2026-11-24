@@ -26,6 +26,16 @@ FAULT = 3      # 1级/2级「故障方块」：高光裂纹/冰晶表面，消�
 
 CELL_NAMES = {EMPTY: ".", NORMAL: "#", CORRUPTED: "X", FAULT: "F"}
 
+# Per-cell icon marks (parallel 8x8 array, independent of the cell type above).
+# A FAULT (crystal) cell can still carry a mark underneath; it only takes effect once the
+# crystal layer is stripped (爆破方块在故障解除前无法引爆).
+MARK_NONE = 0
+MARK_MEDAL = 1     # 收集奖章模式的奖章图标：方块被消除（消失）时收集
+MARK_BOMB = 2      # 无角炸弹：消除时连同周围 8 格（3x3）
+MARK_BOMB_BIG = 3  # 有角炸弹：消除时连同周围 24 格（5x5）
+MARK_NAMES = {MARK_NONE: "", MARK_MEDAL: "m", MARK_BOMB: "b", MARK_BOMB_BIG: "B"}
+BOMB_RADIUS = {MARK_BOMB: 1, MARK_BOMB_BIG: 2}
+
 
 @dataclass(frozen=True)
 class TrayPiece:
@@ -36,6 +46,7 @@ class TrayPiece:
     rows: int
     cols: int
     has_special: bool = False  # bomb / medal icon inside piece
+    specials: tuple = ()  # sorted (r, c) cells (same frame as `cells`) carrying an icon; treated as medals
 
     @property
     def size(self):
@@ -221,11 +232,54 @@ def _classify_cell(bgr_patch, hsv_patch):
     return NORMAL
 
 
-def read_board(frame):
-    """Return 8x8 int ndarray of cell types (EMPTY/NORMAL/CORRUPTED/FAULT)."""
+def tile_features(tile_bgr):
+    """Colour-invariant features of one whole board tile (any size, resized to 64x64).
+
+    Uses the per-pixel min(B, G, R) "whiteness" channel, so pink / orange / blue / purple /
+    teal tiles behave the same: icons are whitish, the tile body is a saturated colour.
+      ring_std : std of whiteness in the outer ring -> crystal facets (>=32.1) vs flat skins (<=23.4)
+      icon     : share of the centre that is much whiter than the ring -> bomb body (0.43-0.50),
+                 medal icon (0.06-0.13), plain logo (0.0)
+      top_grad : mean gradient in the two top corners -> horned bomb spikes (~43) vs round (~10)
+    Calibrated on 2026-11-24 screenshots (live_medal_bombs.png + tests/tile_*.png).
+    """
+    t = cv2.resize(tile_bgr, (64, 64), interpolation=cv2.INTER_AREA)
+    mn = t.min(axis=2).astype(np.float32)
+    gray = cv2.cvtColor(t, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    mag = np.hypot(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    ring = np.zeros((64, 64), dtype=bool)
+    ring[3:61, 3:61] = True
+    ring[10:54, 10:54] = False
+    bg = float(np.median(mn[ring]))
+    return {
+        "ring_std": float(mn[ring].std()),
+        "icon": float((mn[14:54, 14:50] > bg + 70).mean()),
+        "top_grad": 0.5 * float(mag[5:20, 5:20].mean() + mag[5:20, 44:59].mean()),
+    }
+
+
+def classify_tile(tile_bgr):
+    """Return (is_crystal, mark) for an occupied, non-corrupted tile."""
+    f = tile_features(tile_bgr)
+    # Thresholds (2026-11-24 samples): crystal 32.1-54.7 (2级 tutorial tiles are the lowest),
+    # flat skins incl. horned bomb <= 23.4 -> split at 28.
+    if f["ring_std"] > 28.0:
+        # Crystal coat (故障方块). The icon underneath is hard to read through the facets; it is
+        # re-read once the coat is stripped, so report no mark here.
+        return True, MARK_NONE
+    if f["icon"] > 0.30:
+        return False, (MARK_BOMB_BIG if f["top_grad"] > 25.0 else MARK_BOMB)
+    if f["icon"] > 0.03:
+        return False, MARK_MEDAL
+    return False, MARK_NONE
+
+
+def read_board_marks(frame):
+    """Return (grid, marks): cell types plus per-cell icon marks (MARK_*)."""
     h, w = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     grid = np.zeros((N, N), dtype=np.int32)
+    marks = np.zeros((N, N), dtype=np.int32)
     for r in range(N):
         for c in range(N):
             x0, y0, x1, y1 = cell_rect(r, c, w, h)
@@ -233,8 +287,24 @@ def read_board(frame):
             my = (y1 - y0) * 0.14
             ix0, iy0 = int(round(x0 + mx)), int(round(y0 + my))
             ix1, iy1 = int(round(x1 - mx)), int(round(y1 - my))
-            grid[r, c] = _classify_cell(frame[iy0:iy1, ix0:ix1], hsv[iy0:iy1, ix0:ix1])
-    return grid
+            kind = _classify_cell(frame[iy0:iy1, ix0:ix1], hsv[iy0:iy1, ix0:ix1])
+            if kind in (NORMAL, FAULT):
+                tile = frame[int(round(y0)) : int(round(y1)), int(round(x0)) : int(round(x1))]
+                crystal, mark = classify_tile(tile)
+                # Bomb bodies are bright white and used to trip the old frost rule -> trust the
+                # icon classifier: a recognised bomb/medal on a flat skin is NORMAL.
+                if crystal:
+                    kind = FAULT
+                elif mark != MARK_NONE:
+                    kind = NORMAL
+                marks[r, c] = mark
+            grid[r, c] = kind
+    return grid, marks
+
+
+def read_board(frame):
+    """Return 8x8 int ndarray of cell types (EMPTY/NORMAL/CORRUPTED/FAULT)."""
+    return read_board_marks(frame)[0]
 
 
 def _is_connected_8(cells):
@@ -343,10 +413,22 @@ def decode_slot_piece(slot_bgr, slot_idx, box):
     if best_cells is None:
         return None
 
-    # Detect special icon (bomb / medal badge) on piece cells: crisp bright white/silver mark
-    piece_hsv = hsv[y0 : y1 + 1, x0 : x1 + 1]
-    special_frac = float(((piece_hsv[..., 2] > 235) & (piece_hsv[..., 1] < 55)).mean())
-    has_special = special_frac > 0.05
+    # Detect special icons (medal / bomb badge) per piece cell: whitish strokes that stand out
+    # from the cell's own colour. Measured 2026-11-24: icon cells 0.09-0.30, plain cells 0.0.
+    rows, cols = best_dims
+    cw, ch = pw / cols, ph / rows
+    specials = []
+    for r, c in best_cells:
+        cell = inner[
+            y0 + int((r + 0.12) * ch) : y0 + int((r + 0.88) * ch),
+            x0 + int((c + 0.12) * cw) : x0 + int((c + 0.88) * cw),
+        ]
+        if cell.size == 0:
+            continue
+        mn = cell.min(axis=2).astype(np.float32)
+        if float((mn > np.median(mn) + 50).mean()) > 0.05 and float(mn.std()) > 20.0:
+            specials.append((r, c))
+    has_special = bool(specials)
 
     bx0, by0, bx1, by1 = box
     center = (0.5 * (bx0 + bx1), 0.5 * (by0 + by1))
@@ -358,6 +440,7 @@ def decode_slot_piece(slot_bgr, slot_idx, box):
         rows=best_dims[0],
         cols=best_dims[1],
         has_special=has_special,
+        specials=tuple(sorted(specials)),
     )
 
 
@@ -380,10 +463,25 @@ def read_state(frame):
     return read_board(frame), read_tray(frame)
 
 
-def format_board(grid):
-    lines = ["    " + " ".join(str(c) for c in range(N))]
+def read_state_full(frame):
+    """Return (board_8x8, marks_8x8, pieces_list) or None if not inside a playable level."""
+    if not in_level(frame):
+        return None
+    grid, marks = read_board_marks(frame)
+    return grid, marks, read_tray(frame)
+
+
+def format_board(grid, marks=None):
+    """Text board. With marks, each cell is 2 chars: type + mark (m=medal, b=3x3 bomb, B=5x5 bomb)."""
+    if marks is None:
+        lines = ["    " + " ".join(str(c) for c in range(N))]
+        for r in range(N):
+            lines.append(f"r{r}: " + " ".join(CELL_NAMES[int(grid[r, c])] for c in range(N)))
+        return "\n".join(lines)
+    lines = ["    " + " ".join(f"{c} " for c in range(N))]
     for r in range(N):
-        lines.append(f"r{r}: " + " ".join(CELL_NAMES[int(grid[r, c])] for c in range(N)))
+        cells = [CELL_NAMES[int(grid[r, c])] + (MARK_NAMES[int(marks[r, c])] or " ") for c in range(N)]
+        lines.append(f"r{r}: " + " ".join(cells))
     return "\n".join(lines)
 
 
@@ -392,14 +490,14 @@ def format_piece(piece):
         return "(empty)"
     grid = [["." for _ in range(piece.cols)] for _ in range(piece.rows)]
     for r, c in piece.cells:
-        grid[r][c] = "#"
+        grid[r][c] = "m" if (r, c) in piece.specials else "#"
     tag = " [SPECIAL]" if piece.has_special else ""
     return f"Slot {piece.slot_idx} ({piece.rows}x{piece.cols}, {piece.size} cells){tag}:\n" + "\n".join(
         "  " + "".join(row) for row in grid
     )
 
 
-def render_preview(frame, grid, pieces, plan, out_path):
+def render_preview(frame, grid, pieces, plan, out_path, marks=None):
     """Save an annotated visual debug image showing detected board, tray pieces, and planned moves."""
     img = frame.copy()
     h, w = img.shape[:2]
@@ -418,6 +516,8 @@ def render_preview(frame, grid, pieces, plan, out_path):
             cv2.rectangle(img, (x0 + 2, y0 + 2), (x1 - 2, y1 - 2), colors[kind], 1 if kind == EMPTY else 2)
             if kind != EMPTY:
                 cv2.putText(img, CELL_NAMES[kind], (x0 + 6, y0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[kind], 1)
+            if marks is not None and int(marks[r, c]) != MARK_NONE:
+                cv2.putText(img, MARK_NAMES[int(marks[r, c])], (x1 - 18, y0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 255, 255), 2)
 
     # 2. Draw detected tray boxes and step badges
     step_colors = [(50, 60, 255), (0, 165, 255), (255, 220, 40)]  # Step 1 Red, Step 2 Orange, Step 3 Cyan

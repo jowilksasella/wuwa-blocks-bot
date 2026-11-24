@@ -81,10 +81,11 @@ def wait(seconds):
     return False
 
 
-def state_sig(grid, pieces):
+def state_sig(grid, pieces, marks=None):
     return (
         grid.tobytes(),
-        tuple((p.slot_idx, p.cells, p.has_special) if p else None for p in pieces),
+        marks.tobytes() if marks is not None else b"",
+        tuple((p.slot_idx, p.cells, p.specials) if p else None for p in pieces),
     )
 
 
@@ -95,13 +96,13 @@ def stable_state(hwnd, tries=8, gap=0.14):
         if f8_pressed():
             return None
         frame = grab(hwnd)
-        res = vision.read_state(frame)
+        res = vision.read_state_full(frame)
         if res is None:
             return None
-        grid, pieces = res
-        sig = state_sig(grid, pieces)
+        grid, marks, pieces = res
+        sig = state_sig(grid, pieces, marks)
         if sig == prev_sig:
-            return frame, grid, pieces
+            return frame, grid, pieces, marks
         prev_sig = sig
         if wait(gap):
             return None
@@ -137,7 +138,7 @@ def run_probe(hwnd, cfg):
     res = stable_state(hwnd)
     if res is None:
         sys.exit("未偵測到關卡畫面，請先進入拉海洛方塊關卡。")
-    frame, grid, pieces = res
+    frame, grid, pieces, marks = res
     active = [p for p in pieces if p is not None]
     if not active:
         sys.exit("右側沒有可用方塊。")
@@ -245,7 +246,7 @@ def play_loop(hwnd, cfg, max_moves=0, trace=False):
                 return played
             continue
 
-        frame, grid, pieces = res
+        frame, grid, pieces, marks = res
         active = [p for p in pieces if p is not None]
         if not active:
             status("等待右側刷新新一輪方塊...")
@@ -254,7 +255,7 @@ def play_loop(hwnd, cfg, max_moves=0, trace=False):
             continue
 
         t0 = time.perf_counter()
-        plan = solver.solve_batch(grid, pieces, allow_rotate=allow_rotate, beam_width=beam_width)
+        plan = solver.solve_batch(grid, pieces, allow_rotate=allow_rotate, beam_width=beam_width, marks=marks)
         solve_ms = (time.perf_counter() - t0) * 1000.0
 
         if plan is None or not plan.moves:
@@ -274,7 +275,7 @@ def play_loop(hwnd, cfg, max_moves=0, trace=False):
 
         status(f"自動遊玩進行中（模式={input_mode}，按 F8 隨時停止）")
         if trace:
-            print(vision.format_board(grid), flush=True)
+            print(vision.format_board(grid, marks), flush=True)
             for p in active:
                 print(vision.format_piece(p), flush=True)
 
@@ -285,11 +286,14 @@ def play_loop(hwnd, cfg, max_moves=0, trace=False):
         print(
             f"  第 {played + 1} 步 | 槽位 {mv.slot_idx + 1} | 順轉 {mv.rot * 90}° | "
             f"落點 ({mv.top_r + 1},{mv.top_c + 1}) | 消 {mv.lines_cleared} 行/列 (+{mv.points}) | "
-            f"本輪總計 {plan.total_lines} 行/列 | 耗時 {solve_ms:.0f}ms",
+            f"本輪總計 {plan.total_lines} 行/列"
+            + (f" | 獎章 +{mv.medals}（本輪 {plan.total_medals}）" if plan.total_medals or mv.medals else "")
+            + (f" | 引爆 {mv.bombs} 個炸彈" if mv.bombs else "")
+            + f" | 耗時 {solve_ms:.0f}ms",
             flush=True,
         )
 
-        before_sig = state_sig(grid, pieces)
+        before_sig = state_sig(grid, pieces, marks)
         inputs.drag_and_place(
             hwnd,
             sx,
@@ -319,9 +323,9 @@ def play_loop(hwnd, cfg, max_moves=0, trace=False):
             if not vision.in_level(cur):
                 changed = True
                 break
-            cur_g = vision.read_board(cur)
+            cur_g, cur_m = vision.read_board_marks(cur)
             cur_p = vision.read_tray(cur)
-            if state_sig(cur_g, cur_p) != before_sig:
+            if state_sig(cur_g, cur_p, cur_m) != before_sig:
                 changed = True
                 break
             if wait(0.12):
@@ -405,24 +409,29 @@ def main():
         print("in_level:", ok)
         if not ok:
             sys.exit("目前不在「拉海洛方塊 · 逆轉」關卡畫面（或有教學彈窗遮擋）。")
-        grid, pieces = vision.read_state(frame)
-        print(vision.format_board(grid))
+        grid, marks, pieces = vision.read_state_full(frame)
+        print(vision.format_board(grid, marks))
         for p in pieces:
             print(vision.format_piece(p))
         t0 = time.perf_counter()
-        plan = solver.solve_batch(grid, pieces, allow_rotate=bool(cfg["allow_rotate"]), beam_width=int(cfg["beam_width"]))
+        plan = solver.solve_batch(
+            grid, pieces, allow_rotate=bool(cfg["allow_rotate"]), beam_width=int(cfg["beam_width"]), marks=marks
+        )
         dt = (time.perf_counter() - t0) * 1000.0
         if plan:
-            print(f"\n求解完成 ({dt:.1f} ms) | 完整放完={plan.complete_batch} | 預計消 {plan.total_lines} 行/列 (+{plan.total_points}分):")
+            print(
+                f"\n求解完成 ({dt:.1f} ms) | 完整放完={plan.complete_batch} | 預計消 {plan.total_lines} 行/列 "
+                f"(+{plan.total_points}分) | 預計收集獎章 {plan.total_medals}:"
+            )
             for i, mv in enumerate(plan.moves):
                 print(
                     f"  #{i + 1}: 槽位{mv.slot_idx + 1} 順轉{mv.rot * 90}° -> "
-                    f"({mv.top_r + 1},{mv.top_c + 1}) 格={mv.board_cells} 消{mv.lines_cleared}"
+                    f"({mv.top_r + 1},{mv.top_c + 1}) 格={mv.board_cells} 消{mv.lines_cleared} 獎章{mv.medals} 炸彈{mv.bombs}"
                 )
         else:
             print("找不到合法解。")
         out = os.path.join(HERE, "preview.png")
-        vision.render_preview(frame, grid, pieces, plan, out)
+        vision.render_preview(frame, grid, pieces, plan, out, marks=marks)
         print("已輸出標註預覽圖:", out)
         return
 
