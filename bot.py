@@ -49,8 +49,9 @@ DEFAULT_CFG = {
     "batch_refill_wait_s": 0.85,
     "beam_width": 20,
     # 托盤方塊預覽：把方塊拖到棋盤左側、畫面垂直中間（不放下）看清每格是炸彈還是獎章，再拖回原槽。
-    # "icons" = 只預覽托盤小圖上看到圖示的方塊；"all" = 每塊都預覽；"off" = 不預覽（圖示一律當獎章）
-    "peek_tray": "icons",
+    # "off"（預設）= 不拖出預覽，只看形狀；小圖上看到的圖示一律當獎章（不額外拖動，不拖慢節奏）
+    # "icons" = 只預覽小圖有圖示的方塊；"all" = 每塊都預覽
+    "peek_tray": "off",
     "peek_hold_s": 0.25,
 }
 
@@ -291,7 +292,7 @@ def play_loop(hwnd, cfg, max_moves=0, trace=False):
     input_mode = cfg.get("input_mode", "foreground")
     idle_wait_s = float(cfg.get("idle_wait_s", 2.0))
     beam_width = int(cfg["beam_width"])
-    peek_mode = str(cfg.get("peek_tray", "icons")).lower()
+    peek_mode = str(cfg.get("peek_tray", "off")).lower()
     peek_cache = {}
     prev_count = 0
 
